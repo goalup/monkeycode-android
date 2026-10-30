@@ -98,6 +98,9 @@
         {
           "ios": {
             "buildReactNativeFromSource": true
+          },
+          "android": {
+            "usesCleartextTraffic": true
           }
         }
       ]
