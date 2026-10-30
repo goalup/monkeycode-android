@@ -1,0 +1,180 @@
+# 构建 MonkeyCode Android APK（Expo 客户端）。
+#
+# 手动触发：上传 Actions Artifact，便于随时试打。
+# tag 触发（android-v<YYMMDDNN>）：额外创建 Release 并附带 APK。
+#
+# 需要的 Secrets（仓库 Settings → Secrets and variables → Actions），全部可选：
+#   ANDROID_KEYSTORE_BASE64   keystore 的 base64（PKCS12）
+#   ANDROID_KEY_ALIAS         key alias
+#   ANDROID_STORE_PASSWORD    keystore 密码
+#   ANDROID_KEY_PASSWORD      key 密码
+# 未配置时退回 debug 签名，产物名会标明 debug。
+
+name: Android Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（可比较的整数，如 26103101）；留空则由日期与 run_number 生成"
+        required: false
+        type: string
+      arch:
+        description: "打包 ABI"
+        required: false
+        type: choice
+        default: arm64-v8a
+        options:
+          - arm64-v8a
+          - armeabi-v7a
+          - x86_64
+          - universal
+  push:
+    tags:
+      - "android-v[0-9]*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "20"
+  JAVA_VERSION: "17"
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref }}" == refs/tags/android-v* ]]; then
+            V="${GITHUB_REF_NAME#android-v}"
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            V="${{ inputs.version }}"
+          else
+            V="$(date -u +%y%m%d)$(printf '%02d' $(( ${{ github.run_number }} % 100 )))"
+          fi
+          [[ "$V" =~ ^[0-9]+$ ]] || { echo "版本号必须是整数：$V"; exit 1; }
+          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+          node -e "
+            const fs = require('fs');
+            const p = 'app.json';
+            const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+            j.expo.version = String(process.argv[1]);
+            j.expo.android = j.expo.android || {};
+            j.expo.android.versionCode = Number(process.argv[1]);
+            fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');
+          " "$V"
+          node -e "console.log('app.json version ->', require('./app.json').expo.version)"
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Generate native project
+        env:
+          CI: "1"
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Configure ABI
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCH="${{ inputs.arch || 'arm64-v8a' }}"
+          if [[ "$ARCH" == "universal" ]]; then
+            ARCH="armeabi-v7a,arm64-v8a,x86,x86_64"
+          fi
+          sed -i "s/^reactNativeArchitectures=.*/reactNativeArchitectures=$ARCH/" gradle.properties
+          grep '^reactNativeArchitectures=' gradle.properties
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-${{ hashFiles('android/build.gradle', 'android/app/build.gradle') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-
+            gradle-${{ runner.os }}-
+
+      - name: Build APK
+        working-directory: android
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          GRADLE_ARGS=(--no-daemon --stacktrace -Dorg.gradle.jvmargs=-Xmx6g -Dorg.gradle.workers.max=4)
+          if [[ -n "$ANDROID_KEYSTORE_BASE64" ]]; then
+            KS="$RUNNER_TEMP/release.jks"
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$KS"
+            echo "APK_VARIANT=release" >> "$GITHUB_ENV"
+            GRADLE_ARGS+=(
+              -Pandroid.injected.signing.store.file="$KS"
+              -Pandroid.injected.signing.store.password="$ANDROID_STORE_PASSWORD"
+              -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS"
+              -Pandroid.injected.signing.key.password="$ANDROID_KEY_PASSWORD"
+            )
+            ./gradlew assembleRelease "${GRADLE_ARGS[@]}"
+          else
+            echo "::warning::未配置 ANDROID_KEYSTORE_BASE64，产出 debug 签名包"
+            echo "APK_VARIANT=debug" >> "$GITHUB_ENV"
+            ./gradlew assembleDebug "${GRADLE_ARGS[@]}"
+          fi
+
+      - name: Stage APK
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="android/app/build/outputs/apk/${APK_VARIANT}/app-${APK_VARIANT}.apk"
+          test -f "$SRC" || { echo "找不到 APK：$SRC"; find android/app/build/outputs -name '*.apk'; exit 1; }
+          mkdir -p out
+          NAME="MonkeyCode-${APP_VERSION}-android-${APK_VARIANT}.apk"
+          cp "$SRC" "out/$NAME"
+          echo "APK_NAME=$NAME" >> "$GITHUB_ENV"
+          echo "apk=out/$NAME" >> "$GITHUB_OUTPUT"
+          ls -lh out/
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          "$BT/aapt2" dump badging "out/$NAME" | head -5 || true
+          "$BT/apksigner" verify --print-certs "out/$NAME" | head -5 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk-${{ env.APP_VERSION }}
+          path: ${{ steps.stage.outputs.apk }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish Release
+        if: startsWith(github.ref, 'refs/tags/android-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.stage.outputs.apk }}
+          tag_name: ${{ github.ref_name }}
+          name: MonkeyCode Android ${{ env.APP_VERSION }}
+          generate_release_notes: true
