@@ -36,7 +36,7 @@
       "appleTeamId": "8Z56KX83T3"
     },
     "android": {
-      "package": "com.chaitin.baizhi.monkeycode",
+      "package": "com.monkeycode.preview",
       "versionCode": 1,
       "permissions": [
         "RECORD_AUDIO"
